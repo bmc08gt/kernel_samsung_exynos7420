@@ -514,8 +514,16 @@ int avtab_write_item(struct policydb *p, struct avtab_node *cur, void *fp)
 	rc = put_entry(buf16, sizeof(u16), 4, fp);
 	if (rc)
 		return rc;
-	buf32[0] = cpu_to_le32(cur->datum.data);
-	rc = put_entry(buf32, sizeof(u32), 1, fp);
+
+	if (cur->key.specified & AVTAB_OP) {
+		for (i = 0; i < ARRAY_SIZE(cur->datum.u.ops->op.perms); i++)
+			buf32[i] = cpu_to_le32(cur->datum.u.ops->op.perms[i]);
+		rc = put_entry(buf32, sizeof(u32),
+				ARRAY_SIZE(cur->datum.u.ops->op.perms), fp);
+	} else {
+		buf32[0] = cpu_to_le32(cur->datum.u.data);
+		rc = put_entry(buf32, sizeof(u32), 1, fp);
+	}
 	if (rc)
 		return rc;
 	return 0;
