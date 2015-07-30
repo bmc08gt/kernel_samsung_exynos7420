@@ -205,6 +205,265 @@ int avc_get_hash_stats(char *page)
 			 slots_used, AVC_CACHE_SLOTS, max_chain_len);
 }
 
+/*
+ * using a linked list for operation_decision lookup because the list is
+ * always small. i.e. less than 5, typically 1
+ */
+static struct operation_decision *avc_operation_lookup(u8 type,
+					struct avc_operation_node *ops_node)
+{
+	struct avc_operation_decision_node *od_node;
+	struct operation_decision *od = NULL;
+
+	list_for_each_entry(od_node, &ops_node->od_head, od_list) {
+		if (od_node->od.type != type)
+			continue;
+		od = &od_node->od;
+		break;
+	}
+	return od;
+}
+
+static inline unsigned int avc_operation_has_perm(struct operation_decision *od,
+						u16 cmd, u8 specified)
+{
+	unsigned int rc = 0;
+	u8 num = cmd & 0xff;
+
+	if ((specified == OPERATION_ALLOWED) &&
+			(od->specified & OPERATION_ALLOWED))
+		rc = security_operation_test(od->allowed->perms, num);
+	else if ((specified == OPERATION_AUDITALLOW) &&
+			(od->specified & OPERATION_AUDITALLOW))
+		rc = security_operation_test(od->auditallow->perms, num);
+	else if ((specified == OPERATION_DONTAUDIT) &&
+			(od->specified & OPERATION_DONTAUDIT))
+		rc = security_operation_test(od->dontaudit->perms, num);
+	return rc;
+}
+
+static void avc_operation_allow_perm(struct avc_operation_node *node, u16 cmd)
+{
+	struct operation_decision *od;
+	u8 type;
+	u8 num;
+
+	type = cmd >> 8;
+	num = cmd & 0xff;
+	security_operation_set(node->ops.type, type);
+	od = avc_operation_lookup(type, node);
+	if (od && od->allowed)
+		security_operation_set(od->allowed->perms, num);
+}
+
+static void avc_operation_decision_free(
+				struct avc_operation_decision_node *od_node)
+{
+	struct operation_decision *od;
+
+	od = &od_node->od;
+	if (od->allowed)
+		kmem_cache_free(avc_operation_perm_cachep, od->allowed);
+	if (od->auditallow)
+		kmem_cache_free(avc_operation_perm_cachep, od->auditallow);
+	if (od->dontaudit)
+		kmem_cache_free(avc_operation_perm_cachep, od->dontaudit);
+	kmem_cache_free(avc_operation_decision_node_cachep, od_node);
+}
+
+static void avc_operation_free(struct avc_operation_node *ops_node)
+{
+	struct avc_operation_decision_node *od_node;
+
+	if (!ops_node)
+		return;
+
+	list_for_each_entry(od_node, &ops_node->od_head, od_list)
+		avc_operation_decision_free(od_node);
+	kmem_cache_free(avc_operation_node_cachep, ops_node);
+}
+
+static void avc_copy_operation_decision(struct operation_decision *dest,
+					struct operation_decision *src)
+{
+	dest->type = src->type;
+	dest->specified = src->specified;
+	if (dest->specified & OPERATION_ALLOWED)
+		memcpy(dest->allowed->perms, src->allowed->perms,
+				sizeof(src->allowed->perms));
+	if (dest->specified & OPERATION_AUDITALLOW)
+		memcpy(dest->auditallow->perms, src->auditallow->perms,
+				sizeof(src->auditallow->perms));
+	if (dest->specified & OPERATION_DONTAUDIT)
+		memcpy(dest->dontaudit->perms, src->dontaudit->perms,
+				sizeof(src->dontaudit->perms));
+}
+
+/*
+ * similar to avc_copy_operation_decision, but only copy decision
+ * information relevant to this command
+ */
+static inline void avc_quick_copy_operation_decision(u16 cmd,
+			struct operation_decision *dest,
+			struct operation_decision *src)
+{
+	/*
+	 * compute index of the u32 of the 256 bits (8 u32s) that contain this
+	 * command permission
+	 */
+	u8 i = (0xff & cmd) >> 5;
+
+	dest->specified = src->specified;
+	if (dest->specified & OPERATION_ALLOWED)
+		dest->allowed->perms[i] = src->allowed->perms[i];
+	if (dest->specified & OPERATION_AUDITALLOW)
+		dest->auditallow->perms[i] = src->auditallow->perms[i];
+	if (dest->specified & OPERATION_DONTAUDIT)
+		dest->dontaudit->perms[i] = src->dontaudit->perms[i];
+}
+
+static struct avc_operation_decision_node
+		*avc_operation_decision_alloc(u8 specified)
+{
+	struct avc_operation_decision_node *node;
+	struct operation_decision *od;
+
+	node = kmem_cache_zalloc(avc_operation_decision_node_cachep,
+				GFP_ATOMIC | __GFP_NOMEMALLOC);
+	if (!node)
+		return NULL;
+
+	od = &node->od;
+	if (specified & OPERATION_ALLOWED) {
+		od->allowed = kmem_cache_zalloc(avc_operation_perm_cachep,
+						GFP_ATOMIC | __GFP_NOMEMALLOC);
+		if (!od->allowed)
+			goto error;
+	}
+	if (specified & OPERATION_AUDITALLOW) {
+		od->auditallow = kmem_cache_zalloc(avc_operation_perm_cachep,
+						GFP_ATOMIC | __GFP_NOMEMALLOC);
+		if (!od->auditallow)
+			goto error;
+	}
+	if (specified & OPERATION_DONTAUDIT) {
+		od->dontaudit = kmem_cache_zalloc(avc_operation_perm_cachep,
+						GFP_ATOMIC | __GFP_NOMEMALLOC);
+		if (!od->dontaudit)
+			goto error;
+	}
+	return node;
+error:
+	avc_operation_decision_free(node);
+	return NULL;
+}
+
+static int avc_add_operation(struct avc_node *node,
+			struct operation_decision *od)
+{
+	struct avc_operation_decision_node *dest_od;
+
+	node->ae.ops_node->ops.len++;
+	dest_od = avc_operation_decision_alloc(od->specified);
+	if (!dest_od)
+		return -ENOMEM;
+	avc_copy_operation_decision(&dest_od->od, od);
+	list_add(&dest_od->od_list, &node->ae.ops_node->od_head);
+	return 0;
+}
+
+static struct avc_operation_node *avc_operation_alloc(void)
+{
+	struct avc_operation_node *ops;
+
+	ops = kmem_cache_zalloc(avc_operation_node_cachep,
+				GFP_ATOMIC|__GFP_NOMEMALLOC);
+	if (!ops)
+		return ops;
+	INIT_LIST_HEAD(&ops->od_head);
+	return ops;
+}
+
+static int avc_operation_populate(struct avc_node *node,
+				struct avc_operation_node *src)
+{
+	struct avc_operation_node *dest;
+	struct avc_operation_decision_node *dest_od;
+	struct avc_operation_decision_node *src_od;
+
+	if (src->ops.len == 0)
+		return 0;
+	dest = avc_operation_alloc();
+	if (!dest)
+		return -ENOMEM;
+
+	memcpy(dest->ops.type, &src->ops.type, sizeof(dest->ops.type));
+	dest->ops.len = src->ops.len;
+
+	/* for each source od allocate a destination od and copy */
+	list_for_each_entry(src_od, &src->od_head, od_list) {
+		dest_od = avc_operation_decision_alloc(src_od->od.specified);
+		if (!dest_od)
+			goto error;
+		avc_copy_operation_decision(&dest_od->od, &src_od->od);
+		list_add(&dest_od->od_list, &dest->od_head);
+	}
+	node->ae.ops_node = dest;
+	return 0;
+error:
+	avc_operation_free(dest);
+	return -ENOMEM;
+
+}
+
+static inline u32 avc_operation_audit_required(u32 requested,
+					struct av_decision *avd,
+					struct operation_decision *od,
+					u16 cmd,
+					int result,
+					u32 *deniedp)
+{
+	u32 denied, audited;
+
+	denied = requested & ~avd->allowed;
+	if (unlikely(denied)) {
+		audited = denied & avd->auditdeny;
+		if (audited && od) {
+			if (avc_operation_has_perm(od, cmd,
+						OPERATION_DONTAUDIT))
+				audited &= ~requested;
+		}
+	} else if (result) {
+		audited = denied = requested;
+	} else {
+		audited = requested & avd->auditallow;
+		if (audited && od) {
+			if (!avc_operation_has_perm(od, cmd,
+						OPERATION_AUDITALLOW))
+				audited &= ~requested;
+		}
+	}
+
+	*deniedp = denied;
+	return audited;
+}
+
+static inline int avc_operation_audit(u32 ssid, u32 tsid, u16 tclass,
+				u32 requested, struct av_decision *avd,
+				struct operation_decision *od,
+				u16 cmd, int result,
+				struct common_audit_data *ad)
+{
+	u32 audited, denied;
+
+	audited = avc_operation_audit_required(
+			requested, avd, od, cmd, result, &denied);
+	if (likely(!audited))
+		return 0;
+	return slow_avc_audit(ssid, tsid, tclass, requested,
+			audited, denied, result, ad, 0);
+}
+
 static void avc_node_free(struct rcu_head *rhead)
 {
 	struct avc_node *node = container_of(rhead, struct avc_node, rhead);
